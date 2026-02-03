@@ -1,93 +1,24 @@
 # 汉字书法识别器
 
-![screenshot](/assets/screenshot.png)
+An classification on five different Chinese Calligraphy font as well as around 1.7k Chinese characters based on https://github.com/jfxia/shufa.git
 
-**缘起**: 经常遇到龙飞凤舞的书法作品，很多字不认识。于是计划创建一个汉字书法识别的深度学习模型，用户输入一张汉字图片，模型可以识别出对应的汉字。
-
-**设计思路** ：利用爬虫程序在网上抓取汉字书法图片文件，对这些图片清洗整理之后，训练一个基于卷积神经网络CNN的模型，而后即可识别。
-
-**关于数据**： （1）汉字集合来自《晚翠轩词韵》与《通用汉字规范表》；（2）数据采集的工作量最大，书法字体包括有篆书（zs）、隶书（ls）、草书（cs）、行书（xs）、楷书（ks），目前已抓取了6764个汉字的书法图片，另有1174个生僻汉字的图片无法找到，已抓取的图片数量在20万张左右，其中经过清洗后实际可以使用的图片近18万张。
-
-**关于模型**：采用了ResNet50模型，该模型具有比较好的精准度，但模型训练也非常耗时。样本数据测试表明，对于汉字书法的识别率超过85%。模型文件可在HF下载 
-
-https://huggingface.co/xiajingfeng/chinese-calligraphy-recognition-v1
-
-部分测试图片：
-
-![test](/assets/test.png)
-
-目前此模型只能识别单个汉字，因此拍照时若包含多个汉字，需要把欲识别的字切分出来。汉字书法，特别是草书多有连笔（以草圣张旭为代表），难以切分辨认，这就比较考验用户的眼力了。
-
-**程序文件**：
+run
+```bash
+python scraper.py
 ```
-scraper.py： 爬虫程序，抓取书法字体图片，图片保存在chinese_fonts目录，汉字信息保存在SQLite数据库文件font_database.db。
+for running data crawling from https://sf.zdic.net/
 
-clean.py：图片清理程序，找出矢量图、动态gif、小尺寸图片(<50px)，可以将这些图片删除。
-
-train_model.py：训练ResNet50模型，50轮计算，生成best_model.pth模型文件。
-
-gui.py：用户程序，输入图片，检索出置信度最高的5个汉字。
+run
+```bash
+bash train.sh
 ```
-**前置要求**
+for running data train of a ResNet-50 model with two classification heads
 
-开始使用前，请确保已安装以下依赖项：
-
+run
+```bash
+python main.py
 ```
-Python 3.11+
-PyTorch（建议使用CUDA支持以加速训练）
-PyQt5
-PIL
-torchvision
-requests
-beautifulsoup4
-sqlite3
-```
-
-**模型训练**
-
-```
-python train_model.py --data-dir chinese_fonts --epochs 50
-```
-
-在一颗英伟达RTX4070上训练此模型，耗时约9个小时，每5轮生成一个checkpoint文件。
-
-**用户程序运行**
-
-若已有预训练模型（best_model.pth）和字符映射（char_map.json），可以立即开始识别汉字，用户程序运行无需GPU支持。
-
-```
-python gui.py
-```
+to start the web implemenetation of the model for showcase.
 
 
-## 本地Web服务部署
-
-**文件清单**
-
-```
-main.py：基于FastAPI的web后端程序
-
-static/index.html：用户前端页面，可在手机浏览器访问
-
-static/han.png:预览图
-
-char_map.json：汉字映射表
-
-best_model.pth：汉字书法字体模型文件
-```
-
-**启动Web服务**
-
-请安装uvicorn，而后执行如下命令：
-
-```
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
-```
-
-从而在浏览器中访问127.0.0.1:8000。用户也可以在公有云平台部署上述web服务，或者体验作者部署的测试用web服务：
-
-https://huggingface.co/spaces/xiajingfeng/shufa
-
-https://xjf123.dy.takin.cc
-
-![screenshot](/assets/screenshot2.png)
+Due to timely constraints, the project resulted in model heavily overfitting to the crawled dataset.

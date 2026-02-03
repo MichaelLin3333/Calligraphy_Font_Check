@@ -4,6 +4,7 @@ import json
 import torch
 import torch.nn as nn
 from torchvision.models import resnet50
+from train_model import ForkedResNet50
 from torchvision.transforms import transforms
 from PIL import Image, ImageOps, ImageEnhance
 from typing import List, Dict
@@ -16,6 +17,7 @@ import numpy as np
 import hashlib
 import logging
 from PIL.ExifTags import TAGS
+import base64
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
@@ -44,28 +46,49 @@ class Recognizer:
 
         # 构建并加载模型
         self.model = self._get_model(num_classes)
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        checkpoint = torch.load(model_path, map_location=self.device)
+        # Support checkpoints in both formats: {'model_state_dict': ...} or raw state_dict
+        # Works with both old training runs and new improved training
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+        self.model.load_state_dict(state_dict)
         self.model.to(self.device)
-        self.model.eval()
+        self.model.eval()  # Set to evaluation mode (disables dropout)
 
-        # 定义图像预处理
+        # 定义图像预处理 - match training validation pipeline (Resize 256 + CenterCrop 224)
         self.transform = transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
 
     def _get_model(self, num_classes: int) -> nn.Module:
-        model = resnet50(weights=None)
-        num_ftrs = model.fc.in_features
-        model.fc = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(num_ftrs, num_classes)
-        )
+        """
+        Initialize the model architecture (ForkedResNet50 with pretrained backbone).
+        
+        Model features:
+        - Pretrained ResNet50 backbone (ImageNet weights) for better feature transfer
+        - Shared feature extraction layers + task-specific layer4 copies
+        - MLP heads with dropout (0.5) for character and style classification
+        - Better generalization due to regularization
+        
+        To resume from a checkpoint:
+          checkpoint_path = 'latest_checkpoint.pth'
+          checkpoint = torch.load(checkpoint_path)
+          if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+              state_dict = checkpoint['model_state_dict']
+          else:
+              state_dict = checkpoint
+          model.load_state_dict(state_dict)
+        """
+        model = ForkedResNet50(num_classes)
         return model
 
     def preprocess_image(self, image_bytes: bytes, user_agent: str = "") -> Image.Image:
-        """统一的图像预处理，特别处理移动设备上传的图片"""
+        """统一的图像预处理，特别处理移动设备上传的图片，转换为灰度以提高模型性能"""
         try:
             image = Image.open(io.BytesIO(image_bytes))
             
@@ -106,6 +129,12 @@ class Recognizer:
                 # 轻微锐化
                 enhancer = ImageEnhance.Sharpness(image)
                 image = enhancer.enhance(1.1)
+            
+            # 转换为灰度图以减少颜色干扰，提高模型泛化能力
+            logger.info("转换为灰度图")
+            image = image.convert('L')  # Convert to grayscale (8-bit single channel)
+            # 将灰度图转换回RGB格式（3通道）以保持与模型输入兼容
+            image = image.convert('RGB')  # Repeat grayscale channel 3 times
             
             return image
             
@@ -168,12 +197,18 @@ class Recognizer:
 
         with torch.no_grad():
             outputs = self.model(image_tensor)
-            probabilities = torch.nn.functional.softmax(outputs, dim=1)
+            # ForkedResNet50 returns (char_logits, style_logits)
+            if isinstance(outputs, tuple) or isinstance(outputs, list):
+                char_logits, style_logits = outputs
+            else:
+                char_logits = outputs
+
+            probabilities = torch.nn.functional.softmax(char_logits, dim=1)
             top_probs, top_indices = torch.topk(probabilities, top_k)
 
         results = []
-        top_probs_np = top_probs.cpu().numpy().flatten()
-        top_indices_np = top_indices.cpu().numpy().flatten()
+        top_probs_np = top_probs.cpu().detach().numpy().flatten()
+        top_indices_np = top_indices.cpu().detach().numpy().flatten()
 
         for i in range(top_k):
             char_idx = top_indices_np[i]
@@ -186,6 +221,110 @@ class Recognizer:
 
         logger.info(f"识别结果: {results}")
         return results
+
+    def visualize(self, image_bytes: bytes, user_agent: str = "", target='char') -> Dict:
+        """Return processed image, saliency gradient and predictions.
+
+        Returns a dict with keys: 'processed_base64', 'saliency_base64', 'predictions'.
+        """
+        if target not in ('char', 'style'):
+            target = 'char'
+
+        image = self.preprocess_image(image_bytes, user_agent)
+        orig_w, orig_h = image.size
+
+        # Prepare tensor with gradient enabled
+        img_t = self.transform(image).unsqueeze(0).to(self.device)
+        img_t.requires_grad_(True)
+
+        # Forward pass
+        char_logits, style_logits = self.model(img_t)
+
+        # Choose target prediction index
+        probs_char = torch.softmax(char_logits, dim=1)
+        probs_style = torch.softmax(style_logits, dim=1)
+        char_idx = int(torch.argmax(probs_char, dim=1)[0].item())
+        style_idx = int(torch.argmax(probs_style, dim=1)[0].item())
+
+        # Compute gradients w.r.t. input for selected prediction
+        self.model.zero_grad()
+        if target == 'char':
+            score = char_logits[0, char_idx]
+        else:
+            score = style_logits[0, style_idx]
+        score.backward()
+
+        # Extract input gradient (saliency map)
+        input_grad = img_t.grad.detach().cpu().numpy()  # shape: (1, 3, 224, 224)
+
+        # Compute saliency as max absolute gradient across channels
+        saliency = np.max(np.abs(input_grad[0]), axis=0)  # shape: (224, 224)
+
+        # Normalize saliency to [0, 1]
+        saliency = np.maximum(saliency, 0)
+        if saliency.max() > 0:
+            saliency_norm = saliency / saliency.max()
+        else:
+            saliency_norm = saliency
+
+        # Convert to 8-bit grayscale
+        saliency_gray = (saliency_norm * 255).astype(np.uint8)
+        saliency_gray = cv2.resize(saliency_gray, (orig_w, orig_h))
+
+        # Apply JET colormap for visualization
+        saliency_colored = cv2.applyColorMap(saliency_gray, cv2.COLORMAP_JET)
+        saliency_colored = cv2.cvtColor(saliency_colored, cv2.COLOR_BGR2RGB)
+
+        # Encode processed image as PNG base64
+        pil_proc = image.convert('RGB')
+        proc_buf = io.BytesIO()
+        pil_proc.save(proc_buf, format='PNG')
+        proc_b64 = base64.b64encode(proc_buf.getvalue()).decode('ascii')
+
+        # Encode saliency as PNG base64
+        saliency_pil = Image.fromarray(saliency_colored)
+        sal_buf = io.BytesIO()
+        saliency_pil.save(sal_buf, format='PNG')
+        sal_b64 = base64.b64encode(sal_buf.getvalue()).decode('ascii')
+
+        # Font style mapping
+        style_mapping = {0: 'cs', 1: 'ks', 2: 'ls', 3: 'xs', 4: 'zs'}
+        style_name_cn = {
+            'cs': '草书',
+            'ks': '楷书',
+            'ls': '隶书',
+            'xs': '行书',
+            'zs': '篆书'
+        }
+
+        # Prepare predictions
+        results = []
+        topk = 5
+        top_probs, top_indices = torch.topk(probs_char, topk)
+        for p, idx in zip(top_probs[0].detach().cpu().numpy(), top_indices[0].detach().cpu().numpy()):
+            results.append({'char': self.idx_to_char.get(int(idx), '?'), 'prob': float(p)})
+
+        style_results = []
+        topk2 = min(5, probs_style.shape[1])
+        top_probs_s, top_indices_s = torch.topk(probs_style, topk2)
+        for p, idx in zip(top_probs_s[0].detach().cpu().numpy(), top_indices_s[0].detach().cpu().numpy()):
+            style_abbr = style_mapping.get(int(idx), '?')
+            style_cn = style_name_cn.get(style_abbr, '?')
+            style_results.append({'style': style_cn, 'prob': float(p)})
+
+        style_abbr_pred = style_mapping.get(style_idx, '?')
+        style_cn_pred = style_name_cn.get(style_abbr_pred, '?')
+
+        return {
+            'processed_base64': proc_b64,
+            'saliency_base64': sal_b64,
+            'char_results': results,
+            'style_results': style_results,
+            'char_pred': self.idx_to_char.get(char_idx, '?'),
+            'char_conf': float(probs_char[0, char_idx].detach().item()),
+            'style_pred': style_cn_pred,
+            'style_conf': float(probs_style[0, style_idx].detach().item())
+        }
 
 # --- FastAPI 应用初始化 ---
 app = FastAPI(
@@ -267,6 +406,25 @@ async def debug_upload(request: Request, file: UploadFile = File(...)):
         logger.error(f"调试接口错误: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/visualize")
+async def visualize_upload(request: Request, file: UploadFile = File(...)):
+    """Upload an image and return processed image, overlay heatmap, and predictions."""
+    if not recognizer:
+        raise HTTPException(status_code=503, detail="Service unavailable: model not loaded")
+
+    if not file.content_type.startswith('image/'):
+        raise HTTPException(status_code=400, detail='Uploaded file must be an image')
+
+    try:
+        image_bytes = await file.read()
+        user_agent = request.headers.get('User-Agent', '')
+        result = recognizer.visualize(image_bytes, user_agent=user_agent, target='char')
+        return JSONResponse(content=result)
+    except Exception as e:
+        logger.error(f"visualize error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 from fastapi.staticfiles import StaticFiles
 app.mount("/", StaticFiles(directory="static", html=True), name="web")
 
@@ -284,5 +442,5 @@ async def health_check():
     }
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

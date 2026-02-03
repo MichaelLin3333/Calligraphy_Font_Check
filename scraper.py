@@ -7,11 +7,14 @@ import random
 import requests
 import sqlite3
 from bs4 import BeautifulSoup
-from threading import Thread, Lock
+from threading import Thread, Lock, RLock
 from threading import local
 from queue import Queue
 from urllib.parse import urljoin
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # 配置日志
 logging.basicConfig(
@@ -25,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class FontScraper:
-    def __init__(self, output_dir="chinese_fonts", db_path="font_database.db", thread_count=2, min_interval=5.5):
+    def __init__(self, output_dir="chinese_fonts", db_path="font_database.db", thread_count=5, min_interval=3.5):
         """
         初始化爬虫
         
@@ -56,7 +59,11 @@ class FontScraper:
         self.db_path = db_path
         self.thread_count = thread_count
         self.min_interval = min_interval
-        self.last_request_time = 0
+        
+        # Token bucket rate limiter
+        self.rate_limiter_lock = RLock()
+        self.token_bucket_tokens = min_interval  # Start with full bucket
+        self.last_token_refill = time.monotonic()
         
         # 创建输出目录
         os.makedirs(self.output_dir, exist_ok=True)
@@ -68,9 +75,62 @@ class FontScraper:
         # 创建会话，保持cookies
         self.session = requests.Session()
         
+        # 配置会话连接池和重试策略
+        self._setup_session_connection_pooling()
+        
         # 初始化会话和数据库
         self._init_session()
         self._init_database()
+    
+    def _setup_session_connection_pooling(self):
+        """配置会话连接池和重试策略"""
+        # 重试策略：在网络错误、超时或特定HTTP状态码上重试
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],  # 仅在这些状态码上重试
+            allowed_methods=["HEAD", "GET", "POST"]  # 允许POST重试
+        )
+        
+        # HTTPAdapter 配置连接池
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=20,  # 连接池大小
+            pool_maxsize=20       # 最大连接数
+        )
+        
+        # 对HTTP和HTTPS都使用该adapter
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        logger.debug("会话连接池配置完成（pool_size=20）")
+    
+    def _get_token_bucket_wait_time(self):
+        """使用令牌桶算法计算需要等待的时间"""
+        with self.rate_limiter_lock:
+            now = time.monotonic()
+            elapsed = now - self.last_token_refill
+            
+            # 每秒补充 1/min_interval 个令牌
+            tokens_to_add = elapsed / self.min_interval
+            self.token_bucket_tokens = min(self.min_interval, self.token_bucket_tokens + tokens_to_add)
+            self.last_token_refill = now
+            
+            # 如果没有足够的令牌，计算需要等待的时间
+            if self.token_bucket_tokens < 1.0:
+                wait_time = (1.0 - self.token_bucket_tokens) * self.min_interval
+                return wait_time
+            
+            # 消耗一个令牌
+            self.token_bucket_tokens -= 1.0
+            return 0
+    
+    def _ensure_request_interval(self):
+        """使用令牌桶算法确保请求间隔"""
+        wait_time = self._get_token_bucket_wait_time()
+        if wait_time > 0:
+            logger.debug(f"请求间隔限制，等待 {wait_time:.2f} 秒")
+            time.sleep(wait_time)
     
     def _get_headers(self, referer=None):
         """获取请求头"""
@@ -312,16 +372,6 @@ class FontScraper:
         except Exception as e:
             logger.exception(f"读取汉字文件失败: {str(e)}")
             return []
-    
-    def _ensure_request_interval(self):
-        """确保请求间隔大于最小间隔"""
-        current_time = time.time()
-        elapsed = current_time - self.last_request_time
-        if elapsed < self.min_interval:
-            sleep_time = self.min_interval - elapsed
-            logger.debug(f"请求间隔不足，等待 {sleep_time:.2f} 秒")
-            time.sleep(sleep_time)
-        self.last_request_time = time.time()
     
     def _init_session(self):
         """初始化会话，访问主页获取必要的cookies"""
@@ -571,6 +621,38 @@ class FontScraper:
         except Exception as e:
             logger.error(f"解析图片时出错: {str(e)}")
             return []
+    
+    def _download_images_parallel(self, image_urls, character, font_code, font_name, font_dir, max_workers=5):
+        """并行下载多个图片，返回成功下载的文件列表"""
+        image_files = []
+        
+        def download_single_image(args):
+            """下载单个图片的辅助函数"""
+            i, img_url = args
+            ext = os.path.splitext(img_url)[1]
+            if not ext or len(ext) > 5:
+                ext = '.gif'
+            filename = f"{font_code}{i:03d}{ext}"
+            save_path = os.path.join(font_dir, filename)
+            
+            if self._download_image(img_url, save_path, character, font_code, font_name):
+                return save_path
+            return None
+        
+        # 使用线程池并行下载
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(download_single_image, (i, url)): i for i, url in enumerate(image_urls, 1)}
+            
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    if result:
+                        image_files.append(result)
+                except Exception as e:
+                    idx = futures[future]
+                    logger.warning(f"并行下载图片 {idx} 时出错: {str(e)}")
+        
+        return image_files
     
     def _download_image(self, url, save_path, character, font_code, font_name):
         """下载图片，带重试机制，先检查数据库"""
@@ -925,22 +1007,11 @@ class FontScraper:
                 all_images_downloaded = False
                 continue
             
-            # 下载图片
-            image_files = []
-            for i, img_url in enumerate(image_urls, 1):
-                # 生成文件名：字体代码+3位序号+.扩展名
-                ext = os.path.splitext(img_url)[1]
-                if not ext or len(ext) > 5:  # 防止无效扩展名
-                    ext = '.gif'  # 默认使用gif
-                filename = f"{font_code}{i:03d}{ext}"
-                save_path = os.path.join(font_dir, filename)
-                
-                if self._download_image(img_url, save_path, character, font_code, font_name):
-                    image_files.append(save_path)
-                    logger.debug(f"      下载成功: {filename}")
-                else:
-                    logger.warning(f"      下载失败: {filename}")
-                    all_images_downloaded = False
+            # 并行下载图片（最多5个并发下载）
+            image_files = self._download_images_parallel(image_urls, character, font_code, font_name, font_dir, max_workers=5)
+            if len(image_files) < len(image_urls):
+                all_images_downloaded = False
+            logger.info(f"      成功下载 {len(image_files)}/{len(image_urls)} 张图片")
             
             # 重新生成字体索引页面，确保图片顺序正确
             if image_files:
@@ -1020,13 +1091,13 @@ if __name__ == "__main__":
     scraper = FontScraper(
         output_dir="chinese_fonts",
         db_path="font_database.db",  
-        thread_count=3,  # 由于反爬虫机制，线程数不宜过多
-        min_interval=5.5  # 确保大于5秒
+        thread_count=5,  # 使用10个线程实现更好的并发
+        min_interval=3.5  # 使用令牌桶算法，总体速率控制在0.5 req/sec
     )
     scraper.start()
 
-'''    
-    test_char = "无"
+'''
+    test_char = "福"
     logger.info(f"先测试单个已知存在的汉字'{test_char}'")
     if scraper.process_character(test_char):
         logger.info(f"测试成功！'{test_char}'字处理完成")
