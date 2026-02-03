@@ -2,6 +2,8 @@
 
 An classification on five different Chinese Calligraphy font as well as around 1.7k Chinese characters based on https://github.com/jfxia/shufa.git
 
+![](assets/屏幕截图 2026-02-03 083032.png)
+
 run
 ```bash
 python scraper.py
