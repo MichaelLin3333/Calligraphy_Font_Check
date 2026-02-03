@@ -2,7 +2,7 @@
 
 An classification on five different Chinese Calligraphy font as well as around 1.7k Chinese characters based on https://github.com/jfxia/shufa.git
 
-![]('/assets/屏幕截图 2026-02-03 083032.png')
+![]((https://github.com/MichaelLin3333/Calligraphy_Font_Check/blob/main/assets/%E5%B1%8F%E5%B9%95%E6%88%AA%E5%9B%BE%202026-02-03%20083032.png))
 
 run
 ```bash
